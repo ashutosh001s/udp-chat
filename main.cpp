@@ -477,7 +477,10 @@ public:
 #ifdef _WIN32
         PlaySound(TEXT("SystemAsterisk"), NULL, SND_ALIAS | SND_ASYNC);
 #else
-        system("pactl play-sample bell-terminal 2>/dev/null || echo -e '\\a'");
+        // Try PulseAudio first, fallback to terminal bell
+        if (system("pactl play-sample bell-terminal 2>/dev/null") != 0) {
+            std::cout << '\a' << std::flush;
+        }
 #endif
     }
 
