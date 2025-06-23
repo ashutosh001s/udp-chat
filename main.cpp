@@ -1,3 +1,5 @@
+#define _CRT_SECURE_NO_WARNINGS
+
 #include <iostream>
 #include <string>
 #include <thread>
@@ -10,6 +12,18 @@
 #include <unordered_map>
 #include <mutex>
 #include <random>
+#include <deque>
+#include <algorithm>
+
+// OpenGL and GLFW
+#include <glad/glad.h>
+#include <GLFW/glfw3.h>
+
+// Dear ImGui
+#include <imgui/imgui.h>
+#include <imgui/imgui_impl_glfw.h>
+#include <imgui/imgui_impl_opengl3.h>
+
 
 #ifdef _WIN32
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
@@ -18,6 +32,7 @@
 #include <windows.h>
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "opengl32.lib")
 typedef int socklen_t;
 #else
 #include <sys/socket.h>
@@ -37,6 +52,17 @@ typedef int socklen_t;
 #define closesocket close
 #endif
 
+struct ChatMessage {
+    std::string username;
+    std::string content;
+    std::chrono::system_clock::time_point timestamp;
+    bool isSystemMessage = false;
+
+    ChatMessage(const std::string& user, const std::string& msg, bool system = false)
+        : username(user), content(msg), timestamp(std::chrono::system_clock::now()), isSystemMessage(system) {
+    }
+};
+
 struct DeviceInfo {
     std::string username;
     std::string deviceId;
@@ -47,7 +73,7 @@ struct DeviceInfo {
     }
 };
 
-class UDPChatApp {
+class UDPChatGUI {
 private:
     SOCKET sendSock;
     SOCKET recvSock;
@@ -66,16 +92,31 @@ private:
     std::chrono::steady_clock::time_point lastDeviceCleanup;
     std::mutex socketMutex;
     std::mutex deviceMutex;
+    std::mutex chatMutex;
     std::atomic<int> consecutiveErrors;
+
+    // GUI specific members
+    std::deque<ChatMessage> chatMessages;
+    char inputBuffer[512] = "";
+    bool autoScroll = true;
+    bool showDevicesWindow = false;
+    bool showStatusWindow = false;
+    bool showSettingsWindow = false;
+    bool scrollToBottom = false;
+    float chatWindowAlpha = 0.95f;
+    ImVec4 userMessageColor = ImVec4(0.8f, 0.9f, 1.0f, 1.0f);
+    ImVec4 otherMessageColor = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+    ImVec4 systemMessageColor = ImVec4(0.7f, 0.7f, 0.7f, 1.0f);
 
     static const int PORT = 12345;
     static const int BUFFER_SIZE = 1024;
     static const int MAX_RECENT_MESSAGES = 50;
     static const int MAX_CONSECUTIVE_ERRORS = 5;
-    static const int HEALTH_CHECK_INTERVAL = 30; // seconds
-    static const int SOCKET_TIMEOUT = 5; // seconds
-    static const int PING_INTERVAL = 60; // seconds - send ping every minute
-    static const int DEVICE_TIMEOUT = 180; // seconds - device considered offline after 3 minutes
+    static const int HEALTH_CHECK_INTERVAL = 30;
+    static const int SOCKET_TIMEOUT = 5;
+    static const int PING_INTERVAL = 60;
+    static const int DEVICE_TIMEOUT = 180;
+    static const int MAX_CHAT_MESSAGES = 1000;
 
     std::string generateDeviceId() {
         std::random_device rd;
@@ -84,53 +125,26 @@ private:
         return std::to_string(dis(gen));
     }
 
-#ifdef _WIN32
+    void addChatMessage(const std::string& user, const std::string& message, bool isSystem = false) {
+        std::lock_guard<std::mutex> lock(chatMutex);
+        chatMessages.emplace_back(user, message, isSystem);
+
+        if (chatMessages.size() > MAX_CHAT_MESSAGES) {
+            chatMessages.pop_front();
+        }
+
+        scrollToBottom = true;
+    }
+
     void logError(const std::string& message) {
-        auto now = std::chrono::system_clock::now();
-        time_t time = std::chrono::system_clock::to_time_t(now);
-
-        char timeStr[26]; // ctime_s requires a buffer of at least 26 bytes
-        ctime_s(timeStr, sizeof(timeStr), &time);
-
-        // Remove newline added by ctime_s
-        timeStr[24] = '\0';
-
-        std::cout << "\n[ERROR " << timeStr << "] " << message << std::endl;
-        std::cout << "You: " << std::flush;
+        addChatMessage("SYSTEM", "ERROR: " + message, true);
     }
 
     void logInfo(const std::string& message) {
-        auto now = std::chrono::system_clock::now();
-        time_t time = std::chrono::system_clock::to_time_t(now);
-
-        char timeStr[26];
-        ctime_s(timeStr, sizeof(timeStr), &time);
-        timeStr[24] = '\0';
-
-        std::cout << "\n[INFO " << timeStr << "] " << message << std::endl;
-        std::cout << "You: " << std::flush;
+        addChatMessage("SYSTEM", "INFO: " + message, true);
     }
-
-#else
-
-    void logError(const std::string& message) {
-        auto now = std::chrono::system_clock::now();
-        auto time_t = std::chrono::system_clock::to_time_t(now);
-        std::cout << "\n[ERROR " << std::ctime(&time_t) << "] " << message << std::endl;
-        std::cout << "You: " << std::flush;
-    }
-
-    void logInfo(const std::string& message) {
-        auto now = std::chrono::system_clock::now();
-        auto time_t = std::chrono::system_clock::to_time_t(now);
-        std::cout << "\n[INFO " << std::ctime(&time_t) << "] " << message << std::endl;
-        std::cout << "You: " << std::flush;
-    }
-
-#endif // _WIN32
 
     bool testSocketHealth() {
-        // Simple health check - try to send a small packet to ourselves
         std::string testMessage = "HEALTH_CHECK_" + username;
         struct sockaddr_in testAddr;
         memset(&testAddr, 0, sizeof(testAddr));
@@ -146,10 +160,8 @@ private:
 
     void resetSockets() {
         std::lock_guard<std::mutex> lock(socketMutex);
-
         logInfo("Resetting sockets due to health issues...");
 
-        // Close existing sockets
         if (sendSock != INVALID_SOCKET) {
             closesocket(sendSock);
         }
@@ -157,10 +169,8 @@ private:
             closesocket(recvSock);
         }
 
-        // Small delay before recreating
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-        // Recreate sockets
         try {
             initializeSockets();
             consecutiveErrors = 0;
@@ -199,7 +209,6 @@ private:
             freeifaddrs(ifap);
         }
 
-        // Add common addresses as fallback
         if (addresses.empty()) {
             addresses.push_back("255.255.255.255");
             addresses.push_back("192.168.1.255");
@@ -216,14 +225,12 @@ private:
     }
 
     bool isDuplicateMessage(const std::string& message) {
-        // Skip health check messages
         if (message.find("HEALTH_CHECK_") == 0) {
             return true;
         }
 
         auto now = std::chrono::steady_clock::now();
 
-        // Clean up old messages every 30 seconds
         if (now - lastCleanup > std::chrono::seconds(30)) {
             recentMessages.clear();
             lastCleanup = now;
@@ -245,9 +252,7 @@ private:
     }
 
     void sendPing() {
-        if (!socketsHealthy) {
-            return;
-        }
+        if (!socketsHealthy) return;
 
         std::string pingMessage = "PING:" + deviceId + ":" + username;
         std::lock_guard<std::mutex> lock(socketMutex);
@@ -269,9 +274,7 @@ private:
     }
 
     void sendPong(const std::string& targetDeviceId) {
-        if (!socketsHealthy) {
-            return;
-        }
+        if (!socketsHealthy) return;
 
         std::string pongMessage = "PONG:" + deviceId + ":" + username + ":" + targetDeviceId;
         std::lock_guard<std::mutex> lock(socketMutex);
@@ -293,40 +296,26 @@ private:
     }
 
     void handlePingMessage(const std::string& senderDeviceId, const std::string& senderUsername) {
-        // Don't respond to our own ping
-        if (senderDeviceId == deviceId) {
-            return;
-        }
+        if (senderDeviceId == deviceId) return;
 
-        // Update device list
         {
             std::lock_guard<std::mutex> lock(deviceMutex);
             auto it = activeDevices.find(senderDeviceId);
             if (it != activeDevices.end()) {
                 it->second.lastSeen = std::chrono::steady_clock::now();
-                it->second.username = senderUsername; // Update username in case it changed
+                it->second.username = senderUsername;
             }
             else {
                 activeDevices.emplace(senderDeviceId, DeviceInfo(senderUsername, senderDeviceId));
             }
         }
 
-        // Send pong response
         sendPong(senderDeviceId);
     }
 
     void handlePongMessage(const std::string& senderDeviceId, const std::string& senderUsername, const std::string& targetDeviceId) {
-        // Check if this pong is for us
-        if (targetDeviceId != deviceId) {
-            return;
-        }
+        if (targetDeviceId != deviceId || senderDeviceId == deviceId) return;
 
-        // Don't process our own pong
-        if (senderDeviceId == deviceId) {
-            return;
-        }
-
-        // Update device list
         std::lock_guard<std::mutex> lock(deviceMutex);
         auto it = activeDevices.find(senderDeviceId);
         if (it != activeDevices.end()) {
@@ -375,7 +364,7 @@ private:
     }
 
 public:
-    UDPChatApp(const std::string& user) : username(user), running(true), socketsHealthy(true),
+    UDPChatGUI(const std::string& user) : username(user), running(true), socketsHealthy(true),
         sendSock(INVALID_SOCKET), recvSock(INVALID_SOCKET), consecutiveErrors(0) {
         deviceId = generateDeviceId();
         lastCleanup = std::chrono::steady_clock::now();
@@ -385,14 +374,14 @@ public:
         lastDeviceCleanup = std::chrono::steady_clock::now();
 
 #ifndef _WIN32
-        // Ignore SIGPIPE to prevent crashes on broken connections
         signal(SIGPIPE, SIG_IGN);
 #endif
 
         initializeSockets();
+        addChatMessage("SYSTEM", "Chat initialized. Welcome " + username + "!", true);
     }
 
-    ~UDPChatApp() {
+    ~UDPChatGUI() {
         cleanup();
     }
 
@@ -404,7 +393,6 @@ public:
         }
 #endif
 
-        // Create sockets
         sendSock = socket(AF_INET, SOCK_DGRAM, 0);
         recvSock = socket(AF_INET, SOCK_DGRAM, 0);
 
@@ -412,9 +400,8 @@ public:
             throw std::runtime_error("Socket creation failed");
         }
 
-        // Set socket timeouts
 #ifdef _WIN32
-        DWORD timeout = SOCKET_TIMEOUT * 1000; // milliseconds
+        DWORD timeout = SOCKET_TIMEOUT * 1000;
         setsockopt(sendSock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
         setsockopt(recvSock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
 #else
@@ -425,14 +412,12 @@ public:
         setsockopt(recvSock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
 
-        // Configure send socket
         int broadcast = 1;
         if (setsockopt(sendSock, SOL_SOCKET, SO_BROADCAST,
             reinterpret_cast<const char*>(&broadcast), sizeof(broadcast)) < 0) {
             throw std::runtime_error("Error enabling broadcast on send socket");
         }
 
-        // Configure receive socket
         int reuse = 1;
         setsockopt(recvSock, SOL_SOCKET, SO_REUSEADDR,
             reinterpret_cast<const char*>(&reuse), sizeof(reuse));
@@ -440,17 +425,14 @@ public:
 #ifndef _WIN32
         int reusePort = 1;
         setsockopt(recvSock, SOL_SOCKET, SO_REUSEPORT, &reusePort, sizeof(reusePort));
-
         setsockopt(recvSock, SOL_SOCKET, SO_BROADCAST,
             reinterpret_cast<const char*>(&broadcast), sizeof(broadcast));
 #endif
 
-        // Set buffer sizes
         int bufSize = 65536;
         setsockopt(sendSock, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&bufSize), sizeof(bufSize));
         setsockopt(recvSock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bufSize), sizeof(bufSize));
 
-        // Setup addresses
         memset(&broadcastAddr, 0, sizeof(broadcastAddr));
         broadcastAddr.sin_family = AF_INET;
         broadcastAddr.sin_port = htons(PORT);
@@ -461,7 +443,6 @@ public:
         listenAddr.sin_port = htons(PORT);
         listenAddr.sin_addr.s_addr = INADDR_ANY;
 
-        // Bind receive socket
         if (bind(recvSock, reinterpret_cast<struct sockaddr*>(&listenAddr), sizeof(listenAddr)) < 0) {
 #ifdef _WIN32
             throw std::runtime_error("Bind failed. Error: " + std::to_string(WSAGetLastError()));
@@ -469,45 +450,12 @@ public:
             throw std::runtime_error("Bind failed: " + std::string(strerror(errno)));
 #endif
         }
-
-        std::cout << "Sockets initialized successfully on port " << PORT << std::endl;
-    }
-
-    void playNotificationSound() {
-#ifdef _WIN32
-        PlaySound(TEXT("SystemAsterisk"), NULL, SND_ALIAS | SND_ASYNC);
-#else
-        // Try PulseAudio first, fallback to terminal bell
-        if (system("pactl play-sample bell-terminal 2>/dev/null") != 0) {
-            std::cout << '\a' << std::flush;
-        }
-#endif
-    }
-
-    void showNotification(const std::string& message) {
-#ifdef _WIN32
-        std::string title = "UDP Chat";
-        // Suppress only the assembly loading output, keep PowerShell running normally
-        std::string command = "powershell -Command \"[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; $notify = New-Object System.Windows.Forms.NotifyIcon; $notify.Icon = [System.Drawing.SystemIcons]::Information; $notify.Visible = $true; $notify.ShowBalloonTip(3000, '" + title + "', '" + message + "', 'Info')\" 2>nul";
-        system(command.c_str());
-#else
-        std::string escapedMsg = message;
-        size_t pos = 0;
-        while ((pos = escapedMsg.find("'", pos)) != std::string::npos) {
-            escapedMsg.replace(pos, 1, "'\"'\"'");
-            pos += 5;
-        }
-        system(("notify-send 'UDP Chat' '" + escapedMsg + "' 2>/dev/null").c_str());
-#endif
     }
 
     void listenForMessages() {
         char buffer[BUFFER_SIZE];
         struct sockaddr_in senderAddr;
         socklen_t senderLen = sizeof(senderAddr);
-        int consecutiveTimeouts = 0;
-
-        std::cout << "Listening for messages...\n" << std::endl;
 
         while (running) {
             if (!socketsHealthy) {
@@ -524,13 +472,10 @@ public:
                 buffer[bytesReceived] = '\0';
                 std::string message(buffer);
 
-                // Handle ping/pong messages
                 if (message.find("PING:") == 0) {
                     auto parts = parseMessage(message, ':');
                     if (parts.size() >= 3) {
-                        std::string senderDeviceId = parts[1];
-                        std::string senderUsername = parts[2];
-                        handlePingMessage(senderDeviceId, senderUsername);
+                        handlePingMessage(parts[1], parts[2]);
                     }
                     continue;
                 }
@@ -538,74 +483,42 @@ public:
                 if (message.find("PONG:") == 0) {
                     auto parts = parseMessage(message, ':');
                     if (parts.size() >= 4) {
-                        std::string senderDeviceId = parts[1];
-                        std::string senderUsername = parts[2];
-                        std::string targetDeviceId = parts[3];
-                        handlePongMessage(senderDeviceId, senderUsername, targetDeviceId);
+                        handlePongMessage(parts[1], parts[2], parts[3]);
                     }
                     continue;
                 }
 
-                // Handle regular messages
                 if (message.find(username + ":") != 0 && !isDuplicateMessage(message)) {
-                    std::cout << "\r" << message << std::endl;
-                    std::cout << "You: " << std::flush;
-
-                    playNotificationSound();
-                    showNotification(message);
+                    size_t colonPos = message.find(": ");
+                    if (colonPos != std::string::npos) {
+                        std::string msgUsername = message.substr(0, colonPos);
+                        std::string msgContent = message.substr(colonPos + 2);
+                        addChatMessage(msgUsername, msgContent);
+                    }
+                    else {
+                        addChatMessage("Unknown", message);
+                    }
 
                     lastMessageTime = std::chrono::steady_clock::now();
-                    consecutiveTimeouts = 0;
                     consecutiveErrors = 0;
-                }
-            }
-            else {
-#ifdef _WIN32
-                int error = WSAGetLastError();
-                if (error == WSAETIMEDOUT) {
-                    consecutiveTimeouts++;
-                }
-                else if (error != WSAEWOULDBLOCK) {
-                    consecutiveErrors++;
-                    logError("Receive error: " + std::to_string(error));
-                }
-#else
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    consecutiveTimeouts++;
-                }
-                else {
-                    consecutiveErrors++;
-                    logError("Receive error: " + std::string(strerror(errno)));
-                }
-#endif
-
-                // If too many errors, try to reset sockets
-                if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-                    socketsHealthy = false;
-                    resetSockets();
-                    consecutiveTimeouts = 0;
                 }
             }
 
             auto now = std::chrono::steady_clock::now();
 
-            // Periodic health check
             if (now - lastHealthCheck > std::chrono::seconds(HEALTH_CHECK_INTERVAL)) {
                 if (!testSocketHealth()) {
-                    logError("Socket health check failed");
                     socketsHealthy = false;
                     resetSockets();
                 }
                 lastHealthCheck = now;
             }
 
-            // Send periodic ping
             if (now - lastPingTime > std::chrono::seconds(PING_INTERVAL)) {
                 sendPing();
                 lastPingTime = now;
             }
 
-            // Clean up old devices
             if (now - lastDeviceCleanup > std::chrono::seconds(30)) {
                 cleanupOldDevices();
                 lastDeviceCleanup = now;
@@ -616,10 +529,7 @@ public:
     }
 
     void sendMessage(const std::string& message) {
-        if (!socketsHealthy) {
-            logError("Sockets unhealthy, cannot send message");
-            return;
-        }
+        if (!socketsHealthy || message.empty()) return;
 
         std::lock_guard<std::mutex> lock(socketMutex);
 
@@ -642,108 +552,237 @@ public:
                     messageSent = true;
                     consecutiveErrors = 0;
                 }
-                else {
-                    consecutiveErrors++;
-#ifdef _WIN32
-                    logError("Send failed to " + addr + ": " + std::to_string(WSAGetLastError()));
-#else
-                    logError("Send failed to " + addr + ": " + std::string(strerror(errno)));
-#endif
-                }
 
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
         }
 
-        if (!messageSent) {
-            logError("Failed to send message to any address");
-            if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+        if (messageSent) {
+            addChatMessage(username, message);
+        }
+        else {
+            logError("Failed to send message");
+        }
+    }
+
+    void renderChatWindow() {
+        // Get the main viewport
+        ImGuiViewport* viewport = ImGui::GetMainViewport();
+
+        // Set window to cover the entire viewport
+        ImGui::SetNextWindowPos(viewport->WorkPos);
+        ImGui::SetNextWindowSize(viewport->WorkSize);
+        ImGui::SetNextWindowBgAlpha(chatWindowAlpha);
+
+        // Window flags to make it fullscreen and non-movable
+        ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoTitleBar |
+            ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_MenuBar;  // Keep menu bar
+
+        if (ImGui::Begin("UDP Chat", nullptr, window_flags)) {
+            // Render menu bar first
+            renderMenuBar();
+
+            // Chat messages area - leave space for input at bottom
+            float input_height = ImGui::GetFrameHeightWithSpacing() * 2;
+            ImGui::BeginChild("ChatMessages", ImVec2(0, -input_height), true);
+
+            {
+                std::lock_guard<std::mutex> lock(chatMutex);
+                for (const auto& msg : chatMessages) {
+                    ImVec4 color = otherMessageColor;
+                    if (msg.username == username) {
+                        color = userMessageColor;
+                    }
+                    else if (msg.isSystemMessage) {
+                        color = systemMessageColor;
+                    }
+
+                    ImGui::PushStyleColor(ImGuiCol_Text, color);
+
+                    auto time = std::chrono::system_clock::to_time_t(msg.timestamp);
+                    struct tm* timeinfo = localtime(&time);
+                    char timeStr[20];
+                    strftime(timeStr, sizeof(timeStr), "%H:%M:%S", timeinfo);
+
+                    if (msg.isSystemMessage) {
+                        ImGui::Text("[%s] %s", timeStr, msg.content.c_str());
+                    }
+                    else {
+                        ImGui::Text("[%s] %s: %s", timeStr, msg.username.c_str(), msg.content.c_str());
+                    }
+
+                    ImGui::PopStyleColor();
+                }
+            }
+
+            if (scrollToBottom) {
+                ImGui::SetScrollHereY(1.0f);
+                scrollToBottom = false;
+            }
+
+            ImGui::EndChild();
+
+            // Input area
+            ImGui::Separator();
+
+            // Make input field take most of the width, leaving space for Send button
+            float send_button_width = 60.0f;
+            float input_width = ImGui::GetContentRegionAvail().x - send_button_width - ImGui::GetStyle().ItemSpacing.x;
+
+            ImGui::SetNextItemWidth(input_width);
+            if (ImGui::InputTextWithHint("##input", "Type your message...", inputBuffer, sizeof(inputBuffer),
+                ImGuiInputTextFlags_EnterReturnsTrue)) {
+                sendMessage(std::string(inputBuffer));
+                memset(inputBuffer, 0, sizeof(inputBuffer));
+                ImGui::SetKeyboardFocusHere(-1);
+            }
+
+            ImGui::SameLine();
+            if (ImGui::Button("Send", ImVec2(send_button_width, 0))) {
+                sendMessage(std::string(inputBuffer));
+                memset(inputBuffer, 0, sizeof(inputBuffer));
+            }
+        }
+        ImGui::End();
+    }
+
+    void renderDevicesWindow() {
+        if (!showDevicesWindow) return;
+
+        if (ImGui::Begin("Active Devices", &showDevicesWindow)) {
+            ImGui::Text("Your Device ID: %s", deviceId.c_str());
+            ImGui::Text("Your Username: %s", username.c_str());
+            ImGui::Separator();
+
+            std::lock_guard<std::mutex> lock(deviceMutex);
+            auto now = std::chrono::steady_clock::now();
+
+            if (activeDevices.empty()) {
+                ImGui::Text("No other devices detected");
+            }
+            else {
+                if (ImGui::BeginTable("DevicesTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                    ImGui::TableSetupColumn("Device ID");
+                    ImGui::TableSetupColumn("Username");
+                    ImGui::TableSetupColumn("Last Seen");
+                    ImGui::TableHeadersRow();
+
+                    for (const auto& pair : activeDevices) {
+                        const auto& device = pair.second;
+                        auto secondsAgo = std::chrono::duration_cast<std::chrono::seconds>(now - device.lastSeen).count();
+
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%s", device.deviceId.c_str());
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%s", device.username.c_str());
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%llds ago", secondsAgo);
+                    }
+                    ImGui::EndTable();
+                }
+            }
+
+            if (ImGui::Button("Send Ping")) {
+                sendPing();
+            }
+        }
+        ImGui::End();
+    }
+
+    void renderStatusWindow() {
+        if (!showStatusWindow) return;
+
+        if (ImGui::Begin("Status", &showStatusWindow)) {
+            auto now = std::chrono::steady_clock::now();
+            auto timeSinceLastMsg = std::chrono::duration_cast<std::chrono::seconds>(now - lastMessageTime).count();
+
+            ImGui::Text("Device ID: %s", deviceId.c_str());
+            ImGui::Text("Username: %s", username.c_str());
+            ImGui::Text("Port: %d", PORT);
+            ImGui::Text("Sockets Healthy: %s", socketsHealthy ? "Yes" : "No");
+            ImGui::Text("Consecutive Errors: %d", consecutiveErrors.load());
+            ImGui::Text("Time Since Last Message: %llds", timeSinceLastMsg);
+
+            {
+                std::lock_guard<std::mutex> lock(deviceMutex);
+                ImGui::Text("Active Devices: %zu", activeDevices.size());
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(chatMutex);
+                ImGui::Text("Chat Messages: %zu", chatMessages.size());
+            }
+
+            if (ImGui::Button("Reset Sockets")) {
                 socketsHealthy = false;
                 std::thread([this]() { resetSockets(); }).detach();
             }
         }
+        ImGui::End();
     }
 
-    void showDeviceList() {
-        std::lock_guard<std::mutex> lock(deviceMutex);
-        auto now = std::chrono::steady_clock::now();
+    void renderSettingsWindow() {
+        if (!showSettingsWindow) return;
 
-        std::cout << "\n=== Active Devices (" << activeDevices.size() << ") ===" << std::endl;
-        std::cout << "Your Device ID: " << deviceId << std::endl;
-        std::cout << "Your Username: " << username << std::endl;
-        std::cout << "-------------------" << std::endl;
+        if (ImGui::Begin("Settings", &showSettingsWindow)) {
+            ImGui::SliderFloat("Window Transparency", &chatWindowAlpha, 0.3f, 1.0f);
 
-        if (activeDevices.empty()) {
-            std::cout << "No other devices detected" << std::endl;
-        }
-        else {
-            for (const auto& pair : activeDevices) {
-                const auto& device = pair.second;
-                auto secondsAgo = std::chrono::duration_cast<std::chrono::seconds>(now - device.lastSeen).count();
-                std::cout << "Device: " << device.deviceId
-                    << " | User: " << device.username
-                    << " | Last seen: " << secondsAgo << "s ago" << std::endl;
+            ImGui::ColorEdit3("Your Messages", (float*)&userMessageColor);
+            ImGui::ColorEdit3("Other Messages", (float*)&otherMessageColor);
+            ImGui::ColorEdit3("System Messages", (float*)&systemMessageColor);
+
+            ImGui::Checkbox("Auto Scroll", &autoScroll);
+
+            if (ImGui::Button("Clear Chat")) {
+                std::lock_guard<std::mutex> lock(chatMutex);
+                chatMessages.clear();
             }
         }
-        std::cout << "===================\n" << std::endl;
+        ImGui::End();
     }
 
-    void run() {
-        std::cout << "=== Badminton chat ===" << std::endl;
-        std::cout << "Username: " << username << std::endl;
-        std::cout << "Device ID: " << deviceId << std::endl;
-        std::cout << "Port: " << PORT << std::endl;
-        std::cout << "Type 'quit' to exit, 'status' for diagnostics, 'devices' to see active devices\n" << std::endl;
-
-        std::thread listenerThread(&UDPChatApp::listenForMessages, this);
-
-        // Send initial ping to announce presence
-        sendPing();
-
-        std::string input;
-        while (running) {
-            std::cout << "You: ";
-            std::getline(std::cin, input);
-
-            if (input == "quit" || input == "exit") {
-                running = false;
-                break;
+    void renderMenuBar() {
+        if (ImGui::BeginMenuBar()) {
+            if (ImGui::BeginMenu("View")) {
+                ImGui::MenuItem("Devices", nullptr, &showDevicesWindow);
+                ImGui::MenuItem("Status", nullptr, &showStatusWindow);
+                ImGui::MenuItem("Settings", nullptr, &showSettingsWindow);
+                ImGui::EndMenu();
             }
 
-            if (input == "status") {
-                auto now = std::chrono::steady_clock::now();
-                auto timeSinceLastMsg = std::chrono::duration_cast<std::chrono::seconds>(now - lastMessageTime).count();
-
-                std::cout << "\n=== Status ===" << std::endl;
-                std::cout << "Device ID: " << deviceId << std::endl;
-                std::cout << "Sockets healthy: " << (socketsHealthy ? "Yes" : "No") << std::endl;
-                std::cout << "Consecutive errors: " << consecutiveErrors.load() << std::endl;
-                std::cout << "Time since last message: " << timeSinceLastMsg << "s" << std::endl;
-                std::cout << "Active devices: " << activeDevices.size() << std::endl;
-                std::cout << "===============\n" << std::endl;
-                continue;
+            if (ImGui::BeginMenu("Actions")) {
+                if (ImGui::MenuItem("Send Ping")) {
+                    sendPing();
+                }
+                if (ImGui::MenuItem("Clear Chat")) {
+                    std::lock_guard<std::mutex> lock(chatMutex);
+                    chatMessages.clear();
+                }
+                ImGui::EndMenu();
             }
 
-            if (input == "devices") {
-                showDeviceList();
-                continue;
-            }
-
-            if (input == "ping") {
-                sendPing();
-                std::cout << "Ping sent to discover devices...\n" << std::endl;
-                continue;
-            }
-
-            if (!input.empty()) {
-                sendMessage(input);
-            }
-        }
-
-        if (listenerThread.joinable()) {
-            listenerThread.join();
+            ImGui::EndMenuBar();
         }
     }
+
+    void render() {
+        /*if (ImGui::BeginMainMenuBar()) {
+            renderMenuBar();
+            ImGui::EndMainMenuBar();
+        }*/
+
+        renderChatWindow();
+        renderDevicesWindow();
+        renderStatusWindow();
+        renderSettingsWindow();
+    }
+
+    bool isRunning() const { return running; }
+    void stop() { running = false; }
 
     void cleanup() {
         running = false;
@@ -761,18 +800,15 @@ public:
     }
 };
 
-// Static member definitions
-const int UDPChatApp::PORT;
-const int UDPChatApp::BUFFER_SIZE;
-const int UDPChatApp::MAX_RECENT_MESSAGES;
-const int UDPChatApp::MAX_CONSECUTIVE_ERRORS;
-const int UDPChatApp::HEALTH_CHECK_INTERVAL;
-const int UDPChatApp::SOCKET_TIMEOUT;
-const int UDPChatApp::PING_INTERVAL;
-const int UDPChatApp::DEVICE_TIMEOUT;
+// Global variables for GLFW callbacks
+static UDPChatGUI* g_chatInstance = nullptr;
+
+void glfw_error_callback(int error, const char* description) {
+    fprintf(stderr, "GLFW Error %d: %s\n", error, description);
+}
 
 int main(int argc, char* argv[]) {
-    std::string username;
+    std::string username = "User";
 
     if (argc > 1) {
         username = argv[1];
@@ -780,20 +816,141 @@ int main(int argc, char* argv[]) {
     else {
         std::cout << "Enter your username: ";
         std::getline(std::cin, username);
-
         if (username.empty()) {
             username = "Anonymous";
         }
     }
 
+    // Setup GLFW
+    glfwSetErrorCallback(glfw_error_callback);
+    if (!glfwInit()) {
+        return -1;
+    }
+
+    // GL 3.0 + GLSL 130
+    const char* glsl_version = "#version 130";
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+
+    // Create window with graphics context
+    GLFWwindow* window = glfwCreateWindow(800, 600, "UDP Chat GUI", nullptr, nullptr);
+    if (window == nullptr) {
+        glfwTerminate();
+        return -1;
+    }
+
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(1); // Enable vsync
+
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress))
+    {
+        fprintf(stderr, "Failed to initialize OpenGL loader!\n");
+        glfwTerminate();
+        return -1;
+    }
+
+    // Setup Dear ImGui context
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO(); (void)io;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    //io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+
+    // Setup Dear ImGui style
+    ImGui::StyleColorsDark();
+
+    // Setup Platform/Renderer backends
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init(glsl_version);
+
+    // Initialize chat system
     try {
-        UDPChatApp chat(username);
-        chat.run();
+        UDPChatGUI chat(username);
+        g_chatInstance = &chat;
+
+        // Start message listening thread
+        std::thread listenThread(&UDPChatGUI::listenForMessages, &chat);
+
+        // Main loop
+        while (!glfwWindowShouldClose(window) && chat.isRunning()) {
+            glfwPollEvents();
+
+            // Start the Dear ImGui frame
+            ImGui_ImplOpenGL3_NewFrame();
+            ImGui_ImplGlfw_NewFrame();
+            ImGui::NewFrame();
+
+            // Render chat interface
+            chat.render();
+
+            // Rendering
+            ImGui::Render();
+            int display_w, display_h;
+            glfwGetFramebufferSize(window, &display_w, &display_h);
+            glViewport(0, 0, display_w, display_h);
+            glClearColor(0.45f, 0.55f, 0.60f, 1.00f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+            glfwSwapBuffers(window);
+        }
+
+        // Cleanup
+        chat.stop();
+        if (listenThread.joinable()) {
+            listenThread.join();
+        }
+
     }
     catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
-        return 1;
+
+        // Show error in a simple GUI
+        while (!glfwWindowShouldClose(window)) {
+            glfwPollEvents();
+
+            ImGui_ImplOpenGL3_NewFrame();
+            ImGui_ImplGlfw_NewFrame();
+            ImGui::NewFrame();
+
+            ImGui::SetNextWindowSize(ImVec2(400, 200), ImGuiCond_Always);
+            ImGui::SetNextWindowPos(ImVec2(200, 200), ImGuiCond_Always);
+
+            if (ImGui::Begin("Error", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
+                ImGui::Text("Failed to initialize UDP Chat:");
+                ImGui::TextWrapped("%s", e.what());
+                ImGui::Separator();
+                ImGui::Text("This might be due to:");
+                ImGui::BulletText("Port %d already in use", 12345);
+                ImGui::BulletText("Network permissions required");
+                ImGui::BulletText("Firewall blocking UDP traffic");
+                ImGui::Separator();
+                if (ImGui::Button("Close")) {
+                    glfwSetWindowShouldClose(window, true);
+                }
+            }
+            ImGui::End();
+
+            ImGui::Render();
+            int display_w, display_h;
+            glfwGetFramebufferSize(window, &display_w, &display_h);
+            glViewport(0, 0, display_w, display_h);
+            glClearColor(0.45f, 0.55f, 0.60f, 1.00f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+            glfwSwapBuffers(window);
+        }
     }
+
+    // Cleanup ImGui
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+
+    // Cleanup GLFW
+    glfwDestroyWindow(window);
+    glfwTerminate();
 
     return 0;
 }
